@@ -457,7 +457,7 @@ export default function App() {
               const sku = id ? byId(id) : null;
               if (!sku) {
                 return (
-                  <Pressable key={slot} style={[st.gridCell, st.gridEmpty, style]} onPress={() => setSlotPicker(slot)}>
+                  <Pressable key={`${slot}:empty`} style={[st.gridCell, st.gridEmpty, style]} onPress={() => setSlotPicker(slot)}>
                     <Text style={st.gridEmptyPlus}>+</Text>
                     <Text style={st.gridEmptyLabel}>{slot}</Text>
                   </Pressable>
@@ -465,7 +465,7 @@ export default function App() {
               }
               const tint = effectiveColor(sku, slot, state.palette, state.colorOverrides);
               return (
-                <Pressable key={slot} style={[st.gridCell, style]} onPress={() => setSlotPicker(slot)}>
+                <Pressable key={`${slot}:${sku.id}`} style={[st.gridCell, style]} onPress={() => setSlotPicker(slot)}>
                   <GarmentVisual sku={sku} tint={tint} glyphSize={glyphSize} style={st.gridFill} />
                   <View style={st.cellTag}>
                     <Text style={st.cellTagText} numberOfLines={1}>{sku.name}</Text>

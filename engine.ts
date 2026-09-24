@@ -5,6 +5,7 @@
 // requires zero UI changes — that's the point.
 
 import { CATALOG, Collection, Sku, Slot, byId } from './catalog';
+import { IMAGES } from './catalogImages';
 
 export type Outfit = Partial<Record<Slot, string>>; // slot -> sku id
 
@@ -14,6 +15,9 @@ export interface Palette {
 }
 
 export type ColorOverrides = Partial<Record<Slot, string>>; // per-slot tint, wins over palette
+
+export type Tab = 'shop' | 'looks';
+export const TAB_LABELS: Record<Tab, string> = { shop: 'Shop', looks: 'The Look' };
 
 export interface Look {
   id: string;
@@ -71,7 +75,8 @@ export type Command =
   | { tool: 'set_color'; slot: Slot; color: string }
   | { tool: 'clear_palette' }
   | { tool: 'save_look'; name: string }
-  | { tool: 'visualize'; on?: 'me' | 'avatar' };
+  | { tool: 'visualize'; on?: 'me' | 'avatar' }
+  | { tool: 'switch_tab'; tab: Tab };
 
 export interface CommandResult {
   state: AppState;
@@ -110,8 +115,9 @@ export function applyCommand(state: AppState, cmd: Command): CommandResult {
         outfit: state.outfit,
         palette: state.palette,
         color_overrides: state.colorOverrides,
-        looks: state.looks.map((l) => ({ id: l.id, name: l.name })),
-        catalog: CATALOG.map(({ id, name, slot, collection, tone, tintable, tags }) => ({ id, name, slot, collection, tone, tintable: !!tintable, tags })),
+        looks: state.looks.map((l) => ({ id: l.id, name: l.name, outfit: l.outfit, palette: l.palette ?? null, color_overrides: l.colorOverrides ?? {} })),
+        last_action: state.lastAgentAction,
+        catalog: CATALOG.map(({ id, name, slot, collection, price, color, tone, tintable, tags }) => ({ id, name, slot, collection, price, color, tone, tintable: !!tintable, tags, has_image: id in IMAGES })),
       };
       return { state, reply: `state: ${JSON.stringify(summary)}`, data: summary };
     }
@@ -256,6 +262,14 @@ export function applyCommand(state: AppState, cmd: Command): CommandResult {
         state: { ...state, looks: [...state.looks, look], lastAgentAction: `Saved look “${cmd.name}”` },
         reply: `saved look "${cmd.name}" (${look.id}), ${outfitItems(look.outfit).length} pieces`,
       };
+    }
+
+    case 'switch_tab': {
+      if (!(cmd.tab in TAB_LABELS)) {
+        return { state, reply: `error: tab must be one of ${Object.keys(TAB_LABELS).join(', ')}` };
+      }
+      const label = TAB_LABELS[cmd.tab];
+      return { state: { ...state, lastAgentAction: `Showing ${label}` }, reply: `switched to ${label}` };
     }
 
     case 'visualize': {

@@ -28,13 +28,128 @@ import {
   AppState,
   applyCommand,
   Command,
+  CommandResult,
   effectiveColor,
   initialState,
   outfitItems,
   parseCommand,
+  Tab,
+  TAB_LABELS,
 } from './engine';
+import { type Handlers, notifyState, type ToolSpec, useAppBridge } from 'expo-app-bridge';
 
-type Tab = 'shop' | 'looks';
+const S = (name: string, description?: string): { name: string; type: 'String'; description?: string } => ({
+  name,
+  type: 'String',
+  ...(description ? { description } : {}),
+});
+
+// Valid values, read from the catalog so the descriptions below never fall out of step with it.
+const SLOT_NAMES = SLOTS.join(', ');
+const TAG_NAMES = Array.from(new Set(CATALOG.flatMap((s) => s.tags))).sort().join(', ');
+const TONE_NAMES = Array.from(new Set(CATALOG.map((s) => s.tone))).sort().join(', ');
+const idsWhere = (keep: (s: Sku) => boolean) =>
+  SLOTS.map((slot) => `${slot}: ${CATALOG.filter((s) => s.slot === slot && keep(s)).map((s) => s.id).join(', ')}`)
+    .filter((entry) => !entry.endsWith(': '))
+    .join('; ');
+const ITEM_IDS_BY_SLOT = idsWhere(() => true);
+const TINTABLE_IDS_BY_SLOT = idsWhere((s) => !!s.tintable);
+
+// The tool surface a bridge-sdk client sees. The handlers below would be enough on their
+// own - expo-app-bridge derives the contract from their keys - but a client here is usually
+// an LLM choosing a call, and `swap_item(slot, id)` tells it far more than `swap_item(args)`.
+// The package warns in development if the two ever disagree.
+// Every handler's result is serialized to a string over the wire (see expo-app-bridge's
+// sendResult()), so `returns` is always 'String' here - there is no richer type to report.
+export const TOOLS: ToolSpec[] = [
+  { functionName: 'get_state', args: [], returns: 'String', functionDescription: 'The current tab, outfit, palette, colour overrides, last action (shown in the app\'s toast), saved looks (with their pieces), try-on render status, and the catalogue with prices and base colours.' },
+  {
+    functionName: 'search_catalog',
+    returns: 'String',
+    functionDescription: 'Finds catalog items by free-text query, slot, collection or tags. Read-only - does not change the outfit.',
+    args: [
+      S('query', 'Free-text match against an item\'s name and tags. Empty to skip.'),
+      S('slot', 'One of top, bottom, dress, outerwear, shoes, accessory. Empty to match any slot.'),
+      S('collection', 'One of essentials, coast, alpine, festive. Empty to match any collection.'),
+      S('tags', `Comma-separated tags an item must all have, e.g. "beach,summer". Empty to skip. Valid tags: ${TAG_NAMES}; a tone (${TONE_NAMES}) also matches.`),
+    ],
+  },
+  {
+    functionName: 'set_outfit',
+    returns: 'String',
+    functionDescription: 'Sets multiple slots at once from a single map of slot to item id.',
+    // The comma-bearing argument goes last: a client joins arguments with commas and splits
+    // on the first ones, so only the final value keeps its own.
+    args: [
+      { name: 'replace', type: 'boolean', description: 'true clears every slot first; false only overwrites the slots named in slots.' },
+      {
+        name: 'slots',
+        type: 'JSONObject',
+        description: `Map of slot name to item id, e.g. {"top":"alp_01","shoes":"alp_08"}. Keys: ${SLOT_NAMES}. Each id must belong to its slot - ${ITEM_IDS_BY_SLOT}.`,
+      },
+    ],
+  },
+  {
+    functionName: 'swap_item',
+    returns: 'String',
+    functionDescription: 'Puts one item into one slot, replacing whatever was there.',
+    args: [
+      S('slot', `The slot to fill. One of ${SLOT_NAMES}.`),
+      S('id', `The catalog item id to place there; it must belong to that slot - ${ITEM_IDS_BY_SLOT}.`),
+    ],
+  },
+  { functionName: 'clear_slot', returns: 'String', functionDescription: 'Empties one slot.', args: [S('slot', `The slot to empty. One of ${SLOT_NAMES}.`)] },
+  {
+    functionName: 'set_palette',
+    returns: 'String',
+    functionDescription: 'Sets the outfit\'s overall color mood and two accent colors.',
+    args: [
+      S('mood', `One of ${TONE_NAMES}: swaps each item for a same-slot item of that tone. Empty to skip.`),
+      S('primary', 'Primary accent color, as a hex string like "#4A4A44".'),
+      S('secondary', 'Secondary accent color, as a hex string like "#8B5E3C".'),
+    ],
+  },
+  {
+    functionName: 'set_color',
+    returns: 'String',
+    functionDescription: 'Overrides the color of one tintable item in one slot, without changing the palette.',
+    args: [
+      S('slot', `The slot whose item to recolor. It must hold a tintable item - ${TINTABLE_IDS_BY_SLOT}.`),
+      S('color', 'Hex color, e.g. "#334455".'),
+    ],
+  },
+  { functionName: 'clear_palette', returns: 'String', functionDescription: 'Removes the palette and any per-slot color overrides.', args: [] },
+  { functionName: 'save_look', returns: 'String', functionDescription: 'Saves the current outfit under a name, for recall later.', args: [S('name', 'Name to save the current outfit under.')] },
+  {
+    functionName: 'visualize',
+    returns: 'String',
+    functionDescription: 'Requests a rendered preview of the current outfit on the avatar.',
+    args: [S('on', '"avatar" to render on the model, "me" to render on the user\'s photo.')],
+  },
+  {
+    functionName: 'switch_tab',
+    returns: 'String',
+    functionDescription:
+      'Switches the screen the user sees. Changes nothing else. "shop" is the catalogue: every item as a card, ' +
+      'filterable by collection and by category (slot), with a detail view to add an item to the look. ' +
+      '"looks" is The Look: the outfit board with one cell per slot, the palette in use, the try-on render ' +
+      'and its result, a button to save the look, and the saved looks, each of which can be reopened.',
+    args: [
+      {
+        name: 'tab',
+        type: 'String',
+        description: 'One of shop (the Shop tab) or looks (The Look tab).',
+      },
+    ],
+  },
+];
+
+// The bridge carries only String, boolean and JSONObject arguments, so tags travel as
+// comma-separated text; the engine wants the array back.
+function fromBridgeArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (typeof args.tags !== 'string') return args;
+  return { ...args, tags: args.tags.split(',').map((t) => t.trim()).filter(Boolean) };
+}
 
 const STORAGE_KEY = 'drape_state_v1';
 
@@ -254,20 +369,30 @@ export default function App() {
     }
   };
 
-  const publishState = () => {
-    if (!isLeader()) return;
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+
+  /** get_state plus what only the UI knows: the tab, the try-on render, whether a photo is set. */
+  const snapshot = () => {
     const summary = applyCommand(stateRef.current, { tool: 'get_state' }).data as Record<string, unknown>;
     const v = vizRef.current;
+    return {
+      ...summary,
+      tab: tabRef.current,
+      has_photo: !!selfieRef.current,
+      render: v.status === 'done' ? { status: 'done', url: v.url } : { status: v.status },
+    };
+  };
+
+  const publishState = () => {
+    const payload = snapshot();
+    // Bridge client, if one is bound. No leader election: on Android this is one process.
+    notifyState(payload);
+    if (!isLeader()) return;
     fetch(`${VIZ_BASE}/api/command`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        state: {
-          ...summary,
-          has_photo: !!selfieRef.current,
-          render: v.status === 'done' ? { status: 'done', url: v.url } : { status: v.status },
-        },
-      }),
+      body: JSON.stringify({ state: payload }),
     }).catch(() => {});
   };
 
@@ -329,11 +454,12 @@ export default function App() {
     return () => clearTimeout(t);
   }, [state.lastAgentAction]);
 
-  const runCommand = (cmd: Command, echo = true) => {
+  const runCommand = (cmd: Command, echo = true, onResult?: (res: CommandResult) => void) => {
     if (echo) setConsoleLog((l) => [...l, { dir: 'in', text: JSON.stringify(cmd) }]);
     setState((prev) => {
       const res = applyCommand(prev, cmd);
       setConsoleLog((l) => [...l, { dir: 'out', text: res.reply }]);
+      onResult?.(res);
       if (cmd.tool === 'visualize' && Object.keys(prev.outfit).length) {
         if (cmd.on === 'me') {
           (selfieId ? Promise.resolve(selfieId) : pickSelfie()).then((id) => {
@@ -344,9 +470,39 @@ export default function App() {
         }
         setTab('looks');
       }
+      if (cmd.tool === 'switch_tab' && !res.reply.startsWith('error:')) {
+        setTab(cmd.tab);
+      }
       return res.state;
     });
   };
+
+  // A bridge-sdk client drives the very same dispatcher the console and the GPT use.
+  const bridgeHandlers = useMemo<Handlers>(
+    () =>
+      Object.fromEntries(
+        TOOLS.map(({ functionName }) => [
+          functionName,
+          // applyCommand's reply is only available inside the state update, so the answer
+          // is a promise the dispatcher settles.
+          (args: Record<string, unknown>) =>
+            new Promise((resolve) =>
+              runCommand({ tool: functionName, ...fromBridgeArgs(args) } as Command, true, (res) =>
+                resolve({
+                  success: !res.reply.startsWith('error:'),
+                  response: functionName === 'get_state' ? `state: ${JSON.stringify(snapshot())}` : res.reply,
+                  data: res.data,
+                }),
+              ),
+            ),
+        ]),
+      ),
+    // runCommand is redefined every render but always does the same thing; the package
+    // reads handlers through a ref, so this only needs to be built once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  useAppBridge(bridgeHandlers, { tools: TOOLS });
 
   const submitConsole = () => {
     const parsed = parseCommand(consoleInput);
@@ -599,7 +755,7 @@ export default function App() {
         {(['shop', 'looks'] as Tab[]).map((t) => (
           <Pressable key={t} style={st.tabBtn} onPress={() => setTab(t)}>
             <Text style={[st.tabText, tab === t && st.tabTextOn]}>
-              {t === 'shop' ? 'Shop' : 'The Look'}
+              {TAB_LABELS[t]}
             </Text>
           </Pressable>
         ))}
